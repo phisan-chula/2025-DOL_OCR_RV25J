@@ -1,0 +1,6 @@
+VERSION = "AppRV25J_v1.0"
+
+DOL_Office = "__TBD__"
+SURVEY_TYPE = "MAP-L1"
+DEED_EPSG = 24047            # 24048
+
