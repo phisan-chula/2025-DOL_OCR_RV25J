@@ -11,7 +11,7 @@ Pipeline:
                   ->  CALCULATE COORDINATES: Meter + Fraction/1000
                   ->  clean numeric
                   ->  detect closure
-                  ->  *_OCR.toml  <-- CORRECTED OUTPUT NAME
+                  ->  *_OCR.toml
 """
 
 import argparse
@@ -22,35 +22,42 @@ from io import StringIO
 
 import pandas as pd
 from bs4 import BeautifulSoup
-import matplotlib.pyplot as plt
 import numpy as np
 
 # NEW: Import the configuration manager
-# NOTE: Assuming CONFIG_AppRV25J.py is accessible in the environment's path
-# or the current working directory when this script runs.
 try:
+    # Use the local CONFIG_AppRV25J.py file
     from CONFIG_AppRV25J import Config_AppRV25J 
 except ImportError:
     print("[FATAL] Required class Config_AppRV25J not found. Ensure CONFIG_AppRV25J.py is available.")
     sys.exit(1)
 
 
-# ---- TOML reader (No longer strictly needed for config loading, but kept for safe_float if needed elsewhere) ----
+# ---- TOML reader (for robust float conversion only) ----
 try:
     import tomllib  # Python 3.11+
 except ModuleNotFoundError:  # older Python
     import tomli as tomllib  # type: ignore
 
-# ---- Helper Function for robust float conversion ----
+# ---- Helper Function for robust float conversion (REFACTORED) ----
 def safe_float(s):
     """Converts string to float, handles empty string, and cleans non-digit/dot chars."""
-    if not isinstance(s, str) or not s.strip():
+    if not isinstance(s, str):
         return np.nan
-    try:
-        # Clean non-numeric characters first (except for '.')
-        cleaned = re.sub(r"[^0-9.]", "", s)
         
-        # Handle multiple dots (keeping the first one)
+    s = s.strip()
+    if not s:
+        return np.nan
+        
+    try:
+        # Step 1: Normalize and clean non-essential characters (commas, spaces, non-breaking spaces)
+        cleaned = s.replace(",", "").replace("\xa0", " ").replace(" ", "")
+        
+        # Step 2: Clean non-numeric characters (except for '.')
+        # This is a bit redundant after Step 1, but keeps robustness
+        cleaned = re.sub(r"[^0-9.]", "", cleaned)
+        
+        # Step 3: Handle multiple dots (keeping the first one)
         if cleaned.count(".") > 1:
             first, *rest = cleaned.split(".")
             cleaned = first + "." + "".join(rest)
@@ -67,32 +74,76 @@ class RV25jProcessor:
         self.skip_ocr = skip_ocr
         self.pipeline = None # Will be lazily loaded
         
-        # 1. Initialize Config Manager (loads Global config)
-        self.config_manager = Config_AppRV25J(app_file_dir=app_file_dir)
-        
         if not self.root.is_dir():
             raise ValueError(f"[ERROR] Folder not found: {self.root}")
 
+        # 1. Initialize Config Manager and Load Global config
+        print("=" * 70)
+        print("[CONFIG] Starting Cascading Configuration Load...")
+        self.config_manager = self._load_central_config(app_file_dir)
+        
         # 2. Load Local config from the root_folder (project-specific config.toml)
-        # This will merge the local config onto the global one.
-        print(f"[INFO] Loading local configuration from {self.root}...")
+        self.CONFIG = self._load_local_config(self.root) 
+
+        # 3. Load COLUMN_SPEC from the merged configuration
         try:
-            self.config_manager.update_with_local(self.root)
-            self.CONFIG = self.config_manager.CONFIG # Reference to the final merged Series
+            self.COLUMN_SPEC = self.CONFIG["COLSPEC_RV25J"]
+            # Ensure we have exactly 3 columns defined for MRK, N, E
+            if len(self.COLUMN_SPEC) != 3:
+                sys.exit("[FATAL] COLSPEC_RV25J must define exactly 3 columns.")
+            print(f"[CONFIG] Using columns: {self.COLUMN_SPEC}")
+        except KeyError:
+            sys.exit("[FATAL] Configuration missing key: COLSPEC_RV25J")
+        print("=" * 70)
+
+
+    def _load_central_config(self, app_file_dir: Path):
+        """
+        Instantiates Config_AppRV25J and loads GLOBAL configuration, echoing logs.
+        """
+        try:
+            manager = Config_AppRV25J(app_file_dir=app_file_dir)
+            
+            # Call the global load method explicitly to run the setup and capture logs
+            global_log_messages = manager.load_global_config_and_log()
+            
+            # Log the successful messages to console
+            for msg in global_log_messages:
+                 print(f"[CONFIG] {msg}")
+            
+            return manager
+            
+        except RuntimeError as e:
+            # Catch the specific exception raised by the config manager on failure
+            sys.exit(f"[FATAL GLOBAL CONFIG ERROR]: {e}")
+        except Exception as e:
+            # Catch any unexpected errors during instantiation or logging
+            sys.exit(f"[CRITICAL ERROR during config startup]: {e}")
+
+
+    def _load_local_config(self, working_folder: Path) -> pd.Series:
+        """
+        Loads the local config and merges it onto the existing 
+        self._CONFIG_series (Local overwrites Global), echoing logs.
+        Returns: The final merged configuration Series.
+        """
+        print(f"[CONFIG] Attempting to load local config from {working_folder.name}...")
+        try:
+            # Capture and log local load and merge messages
+            merge_log_messages = self.config_manager.update_with_local(working_folder=working_folder)
+            
+            for msg in merge_log_messages:
+                print(f"[CONFIG] {msg}")
+            
+            # Return the final merged configuration
+            return self.config_manager.CONFIG 
+            
         except Exception as e:
             # Catch errors during local config loading, though update_with_local 
             # handles missing files gracefully, we catch parsing/critical errors.
             sys.exit(f"[FATAL] Failed to load or parse local config: {e}")
-
-        # 3. Load COLUMN_SPEC from the merged configuration
-        # NOTE: Based on provided TOMLs, the key is COLSPEC_RV25J, not [META].COLUMN_SPEC
-        try:
-            self.COLUMN_SPEC = self.CONFIG["COLSPEC_RV25J"]
-        except KeyError:
-            sys.exit("[FATAL] Configuration missing key: COLSPEC_RV25J")
-
-        # Removed the heavy OCR initialization from __init__
-
+            
+    
     def _init_ocr_pipeline(self):
         """Initializes the heavy PaddleOCR model only when actually needed."""
         if not self.skip_ocr and self.pipeline is None:
@@ -119,22 +170,20 @@ class RV25jProcessor:
 
     def _ColumnMeterFraction(self, df_raw) -> pd.DataFrame:
         # --- Step 3: Calculation of NORTHING/EASTING (Meters + Fraction/1000) ---
+        MRK_COL, N_COL, E_COL = self.COLUMN_SPEC[0], self.COLUMN_SPEC[1], self.COLUMN_SPEC[2]
         
         # 3a. Rename columns for explicit calculation
-        # The indices (5, 6, 7, 8) are based on the expected *original* 10-column structure.
-        # This is a fixed assumption based on the data format.
-        try:
+        try:               
             coord_map = {
-                df_raw.columns[0]: self.COLUMN_SPEC[0], # Marker Name (e.g., 'MRK_DOL')
-                df_raw.columns[5]: 'N_M',    # Column 6: Northing Meters
-                df_raw.columns[6]: 'N_F',    # Column 7: Northing Fraction
-                df_raw.columns[7]: 'E_M',    # Column 8: Easting Meters
-                df_raw.columns[8]: 'E_F',    # Column 9: Easting Fraction
+                df_raw.columns[ 0]: MRK_COL, # Column 1: Marker Name (e.g., 'MRK_DOL')
+                df_raw.columns[-4]: 'N_M',    # Column 6: Northing Meters
+                df_raw.columns[-3]: 'N_F',    # Column 7: Northing Fraction
+                df_raw.columns[-2]: 'E_M',    # Column 8: Easting Meters
+                df_raw.columns[-1]: 'E_F',    # Column 9: Easting Fraction
             }
-            # Note: This operation may fail if the number of columns is not 9/10 after cleaning
             df_raw.rename(columns=coord_map, inplace=True)
-        except IndexError:
-            print("[WARN] Column index mismatch in _ColumnMeterFraction. Skipping coordinate calculation for this table.")
+        except IndexError as e:
+            print(f"[WARN] Column index mismatch in _ColumnMeterFraction: {e}. Skipping coordinate calculation for this table.")
             return df_raw # Return original if indexing failed
 
         
@@ -142,28 +191,35 @@ class RV25jProcessor:
         coord_cols = ['N_M', 'N_F', 'E_M', 'E_F']
         
         # Correct marker column first (based on the rename map)
-        marker_col = self.COLUMN_SPEC[0]
-        if marker_col in df_raw.columns:
-            df_raw[marker_col] = (df_raw[marker_col].astype(str).str.replace('O', '0')
-                                 .str.replace('o', '0').str.replace('I', '1')
-                                 .str.replace('i', '1').str.replace('l', '1')
-                                 .str.replace('L', '1').str.strip())
-        
+        if MRK_COL in df_raw.columns:
+            # Standard cleanup for non-numeric marker column
+            df_raw[MRK_COL] = (df_raw[MRK_COL].astype(str).str.replace('O', '0', regex=False)
+                                 .str.replace('o', '0', regex=False).str.replace('I', '1', regex=False)
+                                 .str.replace('i', '1', regex=False).str.replace('l', '1', regex=False)
+                                 .str.replace('L', '1', regex=False).str.strip())
+
         for col in coord_cols:
             if col in df_raw.columns:
                 # Apply safe_float (includes internal cleaning) for numeric data
                 df_raw[col] = df_raw[col].apply(safe_float)
             else:
-                 # If a column is missing (e.g. dropped blank), fill with NaN to prevent crash
+                 # If a column is missing, fill with NaN to prevent crash
                  df_raw[col] = np.nan 
                  
         # 3c. Calculate final coordinates
-        df_raw[self.COLUMN_SPEC[1]] = df_raw['N_M'] + (df_raw['N_F'] / 1000.0)
-        df_raw[self.COLUMN_SPEC[2]] = df_raw['E_M'] + (df_raw['E_F'] / 1000.0)
+        df_raw[N_COL] = df_raw['N_M'] + (df_raw['N_F'] / 1000.0)
+        df_raw[E_COL] = df_raw['E_M'] + (df_raw['E_F'] / 1000.0)
+        df_raw[N_COL] = df_raw[N_COL].apply(lambda x: f"{x:.3f}")
+        df_raw[E_COL] = df_raw[E_COL].apply(lambda x: f"{x:.3f}")
         return df_raw
 
     # -----------------------------------------------------------
     def parse_markdown_table(self, md_path: Path) -> pd.DataFrame:
+        """
+        Parses the OCR markdown, cleans blank columns, handles two coordinate formats,
+        and outputs a DataFrame with only the three required columns (MRK, N, E).
+        (REFACTORED)
+        """
         MRK_COL,N_COL,E_COL = self.COLUMN_SPEC 
         html = md_path.read_text(encoding="utf-8", errors="ignore").strip()
         soup = BeautifulSoup(html, "html.parser")
@@ -171,16 +227,17 @@ class RV25jProcessor:
 
         if not table:
             print(f"[WARN] No <table> in {md_path}")
-            return pd.DataFrame(columns=[c for c in self.COLUMN_SPEC if c])
+            return pd.DataFrame(columns=self.COLUMN_SPEC)
 
         try:
             # Use pandas to parse the HTML table back into a DataFrame
             df_raw = pd.read_html(StringIO(str(table)))[0].reset_index(drop=True)
         except Exception as e:
             print(f"[WARN] pandas.read_html failed {md_path}: {e}")
-            return pd.DataFrame(columns=[c for c in self.COLUMN_SPEC if c])
+            return pd.DataFrame(columns=self.COLUMN_SPEC)
 
         # Step 1: Clean up strings (strip whitespace, replace non-breaking space)
+        # Note: Added removal of "\xa0" here, which is also done in safe_float but good to clean early
         df_raw = df_raw.map(
             lambda x: "" if pd.isna(x) else str(x).replace("\xa0", " ").strip()
         )
@@ -194,15 +251,20 @@ class RV25jProcessor:
         if cols_to_drop:
             print(f"[INFO] Dropping blank columns: {cols_to_drop}")
             df_raw = df_raw.drop(columns=cols_to_drop)
-
+            
+        
+        # --- Column Mapping and Calculation ---
+        
         # Determine calculation path based on column count after cleaning
-        if len(df_raw.columns) >= 9:
-            # This is the expected full coordinate table (Marker + 4 pairs)
+        if 6 <= len(df_raw.columns) <= 10:
+            # Path 1: Full Meter/Fraction coordinate table (Marker + 4 pairs)
             df_raw = self._ColumnMeterFraction(df_raw)
-        elif len(df_raw.columns) >= 3:
-            # Assume it's a simplified table where final Northing/Easting are already present 
-            # (e.g., columns 0, -2, -1)
+            # The calculation step automatically creates N_COL and E_COL
+            
+        elif 3 <= len(df_raw.columns) <= 5:
+            # Path 2: Simplified table where final Northing/Easting are already present 
             try:
+                # Assuming columns are: Marker (0), Northing (-2), Easting (-1)
                 coord_map = {
                     df_raw.columns[ 0]: MRK_COL, 
                     df_raw.columns[-2]: N_COL, 
@@ -211,35 +273,43 @@ class RV25jProcessor:
                 df_raw.rename(columns=coord_map, inplace=True)
             except IndexError:
                  print(f"[WARN] Cannot map columns for simplified table in {md_path}.")
-                 return pd.DataFrame(columns=[c for c in self.COLUMN_SPEC if c])
+                 return pd.DataFrame(columns=self.COLUMN_SPEC)
         else:
             print(f"[WARN] Insufficient columns ({len(df_raw.columns)}) to process table in {md_path}.")
-            return pd.DataFrame(columns=[c for c in self.COLUMN_SPEC if c])
+            return pd.DataFrame(columns=self.COLUMN_SPEC)
 
 
-        # --- Step 4: Final Cleaning and Filtering ---
+        # --- Step 4: Final Cleaning, Conversion, and Filtering ---
 
-        # 4a. Explicitly ensure calculated coordinates are clean floats 
+        # 4a. Apply safe_float robustly to the final coordinate columns (Northing, Easting).
+        # This is crucial for Path 2 (simplified table) to clean raw strings.
+        #import pdb ; pdb.set_trace()
         for col in [N_COL, E_COL]:
-            # This handles both cases: calculated floats, or raw strings from simplified table
-            df_raw[col] = pd.to_numeric(df_raw[col], errors='coerce')
+            if col in df_raw.columns:
+                df_raw[col] = df_raw[col].apply(safe_float)
+            else:
+                 df_raw[col] = np.nan # Ensure column exists if mapping failed
         
-        # 4b. Filter out rows where both calculated coordinates are NaN
+        # 4b. Filter out rows where both final coordinates are NaN
         df_raw.dropna(subset=[N_COL, E_COL], how='all', inplace=True)
 
-        # 4c. Remove all extra columns, keeping only the final required columns
-        out_cols = [c for c in self.COLUMN_SPEC if c] 
-        # Select ONLY the final required columns
+        # 4c. Filter columns: Keep ONLY the final required columns (MRK, N, E)
+        out_cols = self.COLUMN_SPEC
+        if not all(col in df_raw.columns for col in out_cols):
+             missing = [c for c in out_cols if c not in df_raw.columns]
+             print(f"[FATAL] Required final columns missing after processing: {missing}")
+             return pd.DataFrame(columns=out_cols)
+             
         df_final = df_raw[out_cols].copy() 
+
 
         # --- Step 5: Final Formatting for TOML output ---
         rows = []
-        marker_col = self.COLUMN_SPEC[0]
         
         for _, rec in df_final.iterrows():
             rec_dict = rec.to_dict() 
             
-            # Format coordinates to 3 decimal places
+            # Format coordinates to 3 decimal places (as strings)
             try:
                 rec_dict[N_COL] = f"{rec_dict[N_COL]:.3f}"
             except Exception:
@@ -361,9 +431,10 @@ class RV25jProcessor:
 
         if not md_files:
             print(f"[WARN] No MD found: {image_path}. Try running without -s.")
-            return pd.DataFrame(columns=[c for c in self.COLUMN_SPEC if c])
-
+            return pd.DataFrame(columns=self.COLUMN_SPEC)
+        
         dfs = [self.parse_markdown_table(md) for md in md_files]
+
         dfs = [df for df in dfs if not df.empty]
         return (
             pd.concat(dfs, ignore_index=True)
@@ -387,7 +458,7 @@ class RV25jProcessor:
         if not isinstance(office, str) or not office.strip():
             sys.exit(f"[FATAL] Invalid DOL_Office: {office}")
 
-        # --- REFACTORED: Use the correct flat keys from TOML (SURVEY_TYPE and DEED_EPSG) ---
+        # --- Use the correct flat keys from TOML (SURVEY_TYPE and DEED_EPSG) ---
         survey_type = self.CONFIG.get("SURVEY_TYPE") 
         epsg = self.CONFIG.get("DEED_EPSG")         
         
@@ -448,8 +519,8 @@ class RV25jProcessor:
         lines.append(f'Survey_Type = "{self._toml_escape(survey_type)}"')
         lines.append(f"EPSG = {epsg_str}")
         lines.append('unit = "meter"')
-        lines.append(f'area_grid = "rai-ngan-wa"')
-        lines.append(f'area_topo = "rai-ngan-wa"')
+        lines.append('area_grid = "rai-ngan-wa"')
+        lines.append('area_topo = "rai-ngan-wa"')
         lines.append("marker = [")
 
         for idx, label, name, n, e in rows:
@@ -495,7 +566,7 @@ class RV25jProcessor:
 
 
 # ============================================================
-# CLI Entry
+# CLI Entry (UNCHANGED)
 # ============================================================
 def main():
     # Expanded description for usage and examples
@@ -542,7 +613,7 @@ Usage Examples for viewing results (assuming common Linux CLI tools are installe
     # Initialize the processor with basic configuration loaded.
     try:
         # Pass app_file_dir (for global config) and args.folder (for local config)
-        processor = RV25jProcessor(app_file_dir=app_file_dir, root_folder=args.folder, skip_ocr=True)
+        processor = RV25jProcessor(app_file_dir=app_file_dir, root_folder=args.folder, skip_ocr=args.skip_ocr)
     except SystemExit as e:
         # Catch and re-raise SystemExit from __init__ for config errors
         print(e)
@@ -556,9 +627,7 @@ Usage Examples for viewing results (assuming common Linux CLI tools are installe
         # Exit immediately after listing, before any heavy OCR initialization
         return
     
-    # If we are processing, set the correct skip_ocr flag for the processor
-    # and proceed. The OCR model will only be loaded inside run_ocr() if skip_ocr is False.
-    processor.skip_ocr = args.skip_ocr
+    # processor.skip_ocr is already set in __init__
     processor.process(image_range=args.images)
 
 

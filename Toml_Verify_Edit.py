@@ -5,12 +5,18 @@ import os
 import shutil
 import json
 from PIL import Image, ImageTk
+from pandas import Series # Ensure Series is imported for type hinting
+from typing import Dict, Any # Added Dict and Any import
 
 # For local plotting functionality
 try:
     import matplotlib.pyplot as plt 
     import numpy as np              
     import pandas as pd 
+    # --- THAI FONT CONFIGURATION FOR MATPLOTLIB ---
+    # Set global font for Matplotlib to a Thai-compatible font like Tahoma
+    plt.rcParams['font.family'] = 'Tahoma' 
+    plt.rcParams['axes.unicode_minus'] = False # Fix minus sign display issue
 except ImportError:
     plt = np = pd = None 
     
@@ -23,11 +29,51 @@ except ImportError:
         tomllib = None
 
 # --- Configuration Constants ---
-DEFAULT_FONT = ('Tahoma', 14)
-TEXT_WIDTH = 30  
-TEXT_HEIGHT = 10 
+DEFAULT_FONT = ('Tahoma', 14) 
+TEXT_WIDTH = 35  
+TEXT_HEIGHT = 12 
 # --- Global Configuration Option ---
 USE_SIMULATED_TOML = False 
+
+# --- Helper Functions for MRK_SEQ Renumbering and TOML Serialization ---
+
+def _to_excel_style_label(n: int) -> str:
+    """Converts a 0-based index (n) to an Excel-style column label (A, B, ..., AA, AB, ...)."""
+    label = ''
+    while n >= 0:
+        label = chr(n % 26 + ord('A')) + label
+        n = n // 26 - 1
+    return label
+
+def _dict_to_simple_toml(data: Dict[str, Any]) -> str:
+    """
+    Simplistic function to serialize a nested dict back to a TOML string, 
+    focused primarily on preserving list/array formatting, as required by the environment.
+    """
+    toml_str = ""
+    for section_name, section_data in data.items():
+        if isinstance(section_data, dict):
+            toml_str += f"\n[{section_name}]\n"
+            for key, value in section_data.items():
+                if key == 'marker' and isinstance(value, list):
+                    # Special handling for marker array of arrays
+                    toml_str += f"marker = [\n"
+                    for row in value:
+                        # Convert Python list to string representation for TOML array
+                        toml_str += f"  {str(row)},\n"
+                    toml_str = toml_str.rstrip(',\n') + "\n]\n"
+                elif isinstance(value, str):
+                    toml_str += f"{key} = \"{value}\"\n"
+                else:
+                    toml_str += f"{key} = {value}\n"
+        elif isinstance(section_data, (str, int, float, bool)):
+            # Top-level keys (META usually handles this, but included for robustness)
+            if isinstance(section_data, str):
+                 toml_str += f"{section_name} = \"{section_data}\"\n"
+            else:
+                 toml_str += f"{section_name} = {section_data}\n"
+    return toml_str.strip()
+
 
 # --- SIMULATED OCR DATA ---
 SIMULATED_OCR_TOML_CONTENT = """[META]
@@ -41,511 +87,406 @@ polygon_closed = false
 marker = [
   [1, "A", "s41", 711042.723, 810293.807],
   [2, "B", "520", 711275.096, 810520.089],
-  [3, "C", "s21", 711325.209, 810466.417],
-  [4, "D", "19", 711354.507, 810440.839],
-  [5, "E", "s24", 711494.218, 810313.001],
-  [6, "F", "$23", 711488.109, 810300.804],
-  [7, "G", "s22", 711328.714, 810147.726],
-  [8, "H", "s42", 711420.856, 810053.505],
-  [9, "I", "S43", 711349.998, 809983.554],
-  [10, "J", "541", 711042.723, 810293.807],
+  [3, "C", "s21", 711343.246, 810520.089]
 ]
 """
 
-# Simple utility class for the text editor widget
-class TOMLTextEditor(tk.Text):
-    def __init__(self, master=None, font_family="Tahoma", font_size=10, *args, **kwargs):
-        tk.Text.__init__(self, master, font=(font_family, font_size), *args, **kwargs)
-        # Setup basic undo mechanism
-        self.config(undo=True, maxundo=50)
+class TextEditor(tk.Text):
+    """Simple wrapper for a Tkinter Text widget."""
+    def __init__(self, master=None, **kwargs):
+        # NOTE: Using DEFAULT_FONT defined globally (Tahoma, 10)
+        super().__init__(master, **kwargs)
+        self.config(
+            wrap=tk.NONE, 
+            undo=True, 
+            font=DEFAULT_FONT,
+            bg='#2E2E2E', 
+            fg='white', 
+            insertbackground='white'
+        )
 
-    def set_content(self, text):
+    def set_content(self, content):
         self.config(state=tk.NORMAL)
-        self.delete('1.0', tk.END)
-        self.insert('1.0', text)
+        self.delete(1.0, tk.END)
+        self.insert(tk.END, content)
         self.config(state=tk.DISABLED)
 
     def get_content(self):
-        return self.get('1.0', tk.END).strip()
+        return self.get(1.0, tk.END).strip()
 
-    def config(self, *args, **kwargs):
-        tk.Text.config(self, *args, **kwargs)
+    def enable_editing(self):
+        """Activates editing mode and sets background to yellow."""
+        self.config(state=tk.NORMAL, bg='yellow', fg='black')
+
+    def disable_editing(self):
+        """Deactivates editing mode and sets background to dark gray."""
+        self.config(state=tk.DISABLED, bg='#2E2E2E', fg='white')
 
 
 class OCRTomlEditor(ttk.Frame):
-    """
-    Component for the right-hand sub-frame managing the OCR process:
-    1. Displaying raw OCR output (read-only)
-    2. Displaying editable verification output (R/W)
-    3. Displaying a plot image (*_plot.png)
-    """
-    def __init__(self, master=None, log_callback=None, column_spec=None, **kwargs):
+    """Panel for verifying, editing, and saving OCR output in TOML format."""
+    def __init__(self, master=None, log_callback=None, **kwargs):
+        self.log = log_callback if log_callback else print
+        self.current_image_path = None
+        self.base_name = None
+        self.output_dir: Path = None 
+        self.config: Series = Series(dtype=object) # Store CONFIG here (Reverted to Series)
+
+        # Defensive move: Filter out configuration keys that might be accidentally passed down
+        if 'column_spec' in kwargs:
+             kwargs.pop('column_spec')
+        if 'COLSPEC_RV25J' in kwargs:
+             kwargs.pop('COLSPEC_RV25J')
+        
         super().__init__(master, **kwargs)
-        self.log_callback = log_callback if log_callback else print
-        
-        # Expected structure: ["MRK_DOL", "NORTHING", "EASTING"]
-        self.COLUMN_SPEC = column_spec if column_spec is not None else []
-        
-        # Expects *_RV25J.jpg
-        self.current_image_path: Path = None  
-        self.plot_tk_image = None 
-        self.current_plot_path: Path = None 
 
-        self.columnconfigure(0, weight=1)
-        
-        self._create_widgets()
-        self.reset_editors()
-        # Bind resize event which is needed for plotting functionality
-        self.plot_canvas.bind('<Configure>', self.on_plot_canvas_resize)
+        self.create_widgets()
 
-    def log(self, message):
-        """Wrapper for the log callback."""
-        self.log_callback(message)
+    def create_widgets(self):
+        # Configuration for grid layout
+        self.grid_rowconfigure(2, weight=1)
+        self.grid_columnconfigure(0, weight=1)
 
-    def _create_widgets(self):
-        """Creates the two TOML editors and the plot image placeholder."""
+        # --- Plot Preview ---
+        preview_frame = ttk.Frame(self, padding="5 5 5 5", relief=tk.RIDGE)
+        preview_frame.grid(row=0, column=0, sticky='ew', pady=(0, 5))
+        
+        # Repurposed label for Plot preview (Restoring original initialization)
+        self.image_plot_label = ttk.Label(preview_frame, text="Plot Preview (Pending Load)", 
+                                           background='#333', foreground='white', 
+                                           anchor='center', width=TEXT_WIDTH) # Restored width=TEXT_WIDTH
+        self.image_plot_label.pack(side=tk.TOP, fill=tk.X, expand=True) # Restored fill=tk.X
+        self.cropped_img_tk = None 
 
-        # --- 1. Raw OCR Output Editor (Top) ---
-        ttk.Label(self, text="1. Raw OCR Output (*_OCR.toml)", font=DEFAULT_FONT).grid(row=0, column=0, sticky='w', padx=5, pady=(5, 0))
+        # --- Editor Pane Caption ---
+        caption_frame = ttk.Frame(self)
+        caption_frame.grid(row=1, column=0, sticky='ew')
+        self.toml_caption_label = ttk.Label(caption_frame, text="TOML Editor: (No File Loaded)", font=DEFAULT_FONT)
+        self.toml_caption_label.pack(side=tk.LEFT)
         
-        self.raw_ocr_editor = TOMLTextEditor(
-            self,
-            width=TEXT_WIDTH,
-            height=TEXT_HEIGHT,
-            font_family=DEFAULT_FONT[0],
-            font_size=DEFAULT_FONT[1],
-            background='#f0f0f0'
-        )
-        self.raw_ocr_editor.grid(row=1, column=0, sticky='nsew', padx=5, pady=(0, 5))
-        self.raw_ocr_editor.config(state=tk.DISABLED) 
-        self.grid_rowconfigure(1, weight=1)
+        # Editor frame remains at row=2
+        editor_frame = ttk.Frame(self)
+        editor_frame.grid(row=2, column=0, sticky='nsew', pady=(5, 0))
+        
+        # Text Editor
+        self.edit_ocr_editor = TextEditor(editor_frame, width=TEXT_WIDTH, height=TEXT_HEIGHT)
+        self.edit_ocr_editor.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # --- 2. Verification Editor (Middle) ---
-        ttk.Label(self, text="2. Verification/Edit (*_OCRedit.toml)", font=DEFAULT_FONT).grid(row=2, column=0, sticky='w', padx=5, pady=(5, 0))
-        
-        self.edit_ocr_editor = TOMLTextEditor(
-            self,
-            width=TEXT_WIDTH,
-            height=TEXT_HEIGHT,
-            font_family=DEFAULT_FONT[0],
-            font_size=DEFAULT_FONT[1],
-            background='yellow' 
-        )
-        self.edit_ocr_editor.grid(row=3, column=0, sticky='nsew', padx=5, pady=(0, 5))
-        self.edit_ocr_editor.config(state=tk.DISABLED, background='#f0f0f0') 
-        self.grid_rowconfigure(3, weight=1)
-        
-        # --- 3. Plot Image Viewer (Bottom) ---
-        ttk.Label(self, text="3. Plot Visualization (*_plot.png) & Markers", font=DEFAULT_FONT).grid(row=4, column=0, sticky='w', padx=5, pady=(5, 0))
+        # Scrollbar
+        v_scroll = ttk.Scrollbar(editor_frame, orient=tk.VERTICAL, command=self.edit_ocr_editor.yview)
+        v_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        self.edit_ocr_editor['yscrollcommand'] = v_scroll.set
 
-        self.plot_canvas = tk.Canvas(
-            self, 
-            bg='white', 
-            relief=tk.SUNKEN, 
-            height=200 
-        )
-        self.plot_canvas.grid(row=5, column=0, sticky='nsew', padx=5, pady=(0, 5))
-        self.grid_rowconfigure(5, weight=1) 
+        # --- Control Buttons ---
+        button_frame = ttk.Frame(self)
+        button_frame.grid(row=3, column=0, sticky='ew', pady=(5, 0))
         
-    def on_plot_canvas_resize(self, event):
-        """Handles canvas resize event by reloading and scaling the current plot image."""
-        if self.current_plot_path and event.width > 1 and event.height > 1:
-            # Prevent excessive logging on every pixel shift
-            if self.current_plot_path.exists():
-                self.load_plot_image(self.current_plot_path)
+        # Edit/Save button
+        self.save_edit_button = ttk.Button(button_frame, text="Edit/Save TOML", command=self.on_save_or_edit_click)
+        self.save_edit_button.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        # Rerun MRK_SEQ button with confirmation dialog
+        ttk.Button(button_frame, text="Rerun MRK_SEQ", command=self.confirm_RerunMRK_SEQ).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        
+        # Initial state
+        self.edit_ocr_editor.disable_editing()
+        self.is_editing = False
 
-    def reset_editors(self):
-        """Clears content and disables the editors."""
-        self.raw_ocr_editor.config(state=tk.NORMAL)
-        self.edit_ocr_editor.config(state=tk.NORMAL, background='yellow')
-        
-        self.raw_ocr_editor.set_content("# No OCR data loaded.")
-        self.edit_ocr_editor.set_content("# Press 'OCR' to generate data.")
-        
-        self.raw_ocr_editor.config(state=tk.DISABLED)
-        self.edit_ocr_editor.config(state=tk.DISABLED, background='#f0f0f0')
-        
-        self.plot_canvas.delete(tk.ALL)
-        self.plot_tk_image = None
-        self.current_plot_path = None 
-        self.plot_canvas.create_text(
-            self.plot_canvas.winfo_width() / 2, self.plot_canvas.winfo_height() / 2, 
-            text="Plot Image Area", fill="#666", anchor=tk.CENTER
-        )
+    def _display_plot_image(self, plot_path: Path):
+        """Loads the plot image (*_plot.png) and displays it in the preview label. (Original logic restored)"""
+        self.cropped_img_tk = None 
 
-    def load_files(self, parent_dir: Path, base_name_str: str):
+        if not plot_path.exists():
+            error_text = f"INFO: Plot not found.\nExpected Path: {plot_path.name}"
+            self.image_plot_label.config(text=error_text, image="")
+            self.log(f"INFO: Plot file missing at {plot_path.resolve()}")
+            return
+
+        try:
+            img = Image.open(plot_path)
+            
+            # Resize for preview (Original resize logic restored)
+            max_width = 600
+            if img.width > max_width:
+                ratio = max_width / img.width
+                new_size = (max_width, int(img.height * ratio))
+                img = img.resize(new_size, Image.Resampling.LANCZOS)
+
+            self.cropped_img_tk = ImageTk.PhotoImage(img)
+            self.image_plot_label.config(image=self.cropped_img_tk, text="")
+            self.log(f"INFO: Plot preview loaded: {plot_path.name}")
+        except Exception as e:
+            self.log(f"ERROR loading plot image for preview: {e}")
+            self.image_plot_label.config(text=f"ERROR loading plot: {plot_path.name}\n{e}", image="")
+            self.cropped_img_tk = None
+
+    def load_files(self, output_dir: Path, base_name: str, config: Series): # Reverted type hint to Series
         """
-        Loads the corresponding *_OCR.toml, *_OCRedit.toml, and *_plot.png 
-        for the given directory and base file name.
+        Loads the relevant files (OCR TOML, Plot) for the selected image.
         """
-        self.current_image_path = parent_dir / base_name_str / f"{base_name_str}_RV25J.jpg"
+        self.output_dir = output_dir
+        self.base_name = base_name
+        self.config = config # Store the configuration Series
         
-        ocr_toml_path = parent_dir / base_name_str / f"{base_name_str}_OCR.toml"
-        edit_toml_path = parent_dir / base_name_str / f"{base_name_str}_OCRedit.toml"
-        plot_png_path = parent_dir / base_name_str / f"{base_name_str}_plot.png" 
-        #import pdb; pdb.set_trace()
-        self.reset_editors()
+        # 2. Load TOML (Prefer edit, fallback to original OCR, then mock)
+        edit_toml_path = self.output_dir / f"{self.base_name}_OCRedit.toml"
+        ocr_toml_path = self.output_dir / f"{self.base_name}_OCR.toml"
         
-        # --- Load Raw OCR TOML ---
-        self.log(f"I/O READ: Checking for Raw OCR TOML: {ocr_toml_path.name}")
-        if ocr_toml_path.exists():
-            try:
-                raw_content = ocr_toml_path.read_text(encoding='utf-8')
-                self.raw_ocr_editor.config(state=tk.NORMAL)
-                self.raw_ocr_editor.set_content(raw_content)
-                self.raw_ocr_editor.config(state=tk.DISABLED)
-                self.log(f"SUCCESS: Loaded raw OCR TOML from {ocr_toml_path.name}.")
-            except Exception as e:
-                self.log(f"ERROR: Failed to read raw OCR TOML {ocr_toml_path.name}: {e}")
-        else:
-            self.log(f"WARNING: Raw OCR TOML not found: {ocr_toml_path.name}.")
+        toml_content = ""
+        toml_path = None
+        toml_filename = "(No File Loaded)" # Default caption
 
-        # --- Load Editable TOML ---
-        self.log(f"I/O READ: Checking for Editable TOML: {edit_toml_path.name}")
         if edit_toml_path.exists():
-            try:
-                edit_content = edit_toml_path.read_text(encoding='utf-8')
-                self.edit_ocr_editor.config(state=tk.NORMAL)
-                self.edit_ocr_editor.set_content(edit_content)
-                self.edit_ocr_editor.config(state=tk.DISABLED, background='#f0f0f0') 
-                self.log(f"SUCCESS: Loaded editable TOML from {edit_toml_path.name}.")
-            except Exception as e:
-                self.log(f"ERROR: Failed to read editable TOML {edit_toml_path.name}: {e}")
+            toml_path = edit_toml_path
+            toml_filename = edit_toml_path.name
         elif ocr_toml_path.exists():
+            toml_path = ocr_toml_path
+            toml_filename = ocr_toml_path.name
+        elif USE_SIMULATED_TOML:
+            toml_content = SIMULATED_OCR_TOML_CONTENT
+            toml_filename = "Simulated Content"
+            self.log("INFO: Using simulated TOML data.")
+        
+        if toml_path:
             try:
-                self.log(f"I/O WRITE: Copying {ocr_toml_path.name} to {edit_toml_path.name}")
-                shutil.copy(ocr_toml_path, edit_toml_path)
-                edit_content = ocr_toml_path.read_text(encoding='utf-8')
-                self.edit_ocr_editor.config(state=tk.NORMAL)
-                self.edit_ocr_editor.set_content(edit_content)
-                self.edit_ocr_editor.config(state=tk.DISABLED, background='#f0f0f0')
-                self.log(f"SUCCESS: Copied {ocr_toml_path.name} to {edit_toml_path.name} for editing.")
+                toml_content = toml_path.read_text(encoding='utf-8')
+                self.log(f"INFO: Loaded TOML from: {toml_path.name}")
             except Exception as e:
-                self.log(f"ERROR: Failed to copy OCR TOML for editing: {e}")
+                self.log(f"ERROR reading TOML file {toml_path.name}: {e}")
+                toml_content = f"# ERROR loading {toml_path.name}: {e}"
         
-        # --- Plotting ---
-        self.current_plot_path = plot_png_path 
+        # 1. Update TOML Caption Label
+        self.toml_caption_label.config(text=f"TOML Editor: {toml_filename}")
+        
+        # 4. Update Editor state
+        self.edit_ocr_editor.set_content(toml_content)
+        self.edit_ocr_editor.disable_editing()
+        self.save_edit_button.config(text="Edit/Save TOML")
+        self.is_editing = False
 
-        # 1. Load existing plot image immediately if it exists
-        self.log(f"I/O READ: Checking for Plot Image: {plot_png_path.name}")
-        self.load_plot_image(plot_png_path) 
-        
-        # 2. Re-create the plot based on the TOML data
-        if edit_toml_path.exists() and plt is not None:
-             self.create_parcel_plot(edit_toml_path)
-        
-
-    def load_plot_image(self, plot_path: Path):
-        """Loads and scales the plot image to fit the canvas."""
-        
-        if plot_path == self.current_plot_path:
-             self.plot_canvas.delete(tk.ALL)
-             self.plot_tk_image = None
-        
-        if plot_path.exists():
-            try:
-                pil_image = Image.open(plot_path)
-                
-                self.update_idletasks()
-                canvas_w = self.plot_canvas.winfo_width()
-                canvas_h = self.plot_canvas.winfo_height()
-                
-                if canvas_w < 10 or canvas_h < 10: return
-
-                img_w, img_h = pil_image.size
-                scale = min(canvas_w / img_w, canvas_h / img_h)
-                
-                new_w = int(img_w * scale)
-                new_h = int(img_h * scale)
-                
-                if scale < 1.0:
-                    resized_image = pil_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                else:
-                    resized_image = pil_image
-                
-                self.plot_tk_image = ImageTk.PhotoImage(resized_image)
-                
-                x_center = (canvas_w - new_w) // 2
-                y_center = (canvas_h - new_h) // 2
-                
-                self.plot_canvas.create_image(x_center, y_center, image=self.plot_tk_image, anchor=tk.NW)
-
-            except Exception as e:
-                self.log(f"ERROR: Failed to load plot image {plot_path.name}: {e}")
+        # 3. Load Plot Image for Preview (Trigger plot generation if TOML exists)
+        # FIX: Always call on_plot_click if we have TOML content to ensure plot is generated and displayed immediately
+        if toml_content and toml_content.strip():
+             self.on_plot_click()
         else:
-            self.plot_canvas.create_text(
-                self.plot_canvas.winfo_width() / 2, self.plot_canvas.winfo_height() / 2, 
-                text=f"Plot Image Not Found: {plot_path.name}", fill="#888", anchor=tk.CENTER
-            )
-    
-    def _extract_and_parse_markers(self, toml_path: Path) -> list[list]:
-        """
-        Reads the TOML file and extracts the marker array using the tomllib library.
-        """
-        if tomllib is None:
-            self.log("ERROR: 'tomllib' is required. Cannot parse TOML.")
-            return []
+             plot_path = self.output_dir / f"{self.base_name}_plot.png"
+             self._display_plot_image(plot_path) # Show existing plot or 'not found' message
 
-        if not toml_path.exists():
-            self.log(f"WARNING: TOML file not found: {toml_path.name}.")
-            return []
 
-        try:
-            self.log(f"INFO: Using tomllib to parse {toml_path.name}.")
+    def confirm_RerunMRK_SEQ(self):
+        """
+        Shows a confirmation dialog before running RerunMRK_SEQ.
+        """
+        # Ensure we have a file loaded before showing the dialog
+        if not self.output_dir or not self.base_name:
+            self.log("ERROR: No file loaded. Cannot re-sequence.")
+            messagebox.showwarning("Action Required", "Please load an image file first.")
+            return
+
+        warning_message = (
+            "WARNING: This action will overwrite the 'SEQ_NUM' (Marker Number) and 'MRK_SEQ' (Marker Label) columns "
+            f"in {self.base_name}_OCRedit.toml.\n\n"
+            "SEQ_NUM will be reset to 1, 2, 3, ...\n"
+            "MRK_SEQ will be reset to A, B, C, ..., AA, AB, ... (Excel-style).\n\n"
+            "Do you wish to proceed and overwrite the file?"
+        )
+        
+        if messagebox.askyesno("Confirm Marker Re-sequence", warning_message):
+            self.RerunMRK_SEQ()
+        else:
+            self.log("INFO: Marker re-sequencing cancelled by user.")
+
+
+    def RerunMRK_SEQ(self):
+        """
+        Reads *_OCRedit.toml, re-sequences both SEQ_NUM and MRK_SEQ columns, 
+        and overwrites the TOML content.
+        """
+        if not self.output_dir or not self.base_name or not tomllib or not pd:
+            self.log("ERROR: Initialization incomplete or libraries missing (Pandas/TOML).")
+            return
             
-            with open(toml_path, 'rb') as f:
-                toml_data = tomllib.load(f)
-
+        edit_toml_path = self.output_dir / f"{self.base_name}_OCRedit.toml"
+        
+        if not edit_toml_path.exists():
+            self.log(f"ERROR: TOML file not found for editing: {edit_toml_path.name}")
+            return
+            
+        try:
+            # 1. Read and Parse TOML
+            toml_content = edit_toml_path.read_text(encoding='utf-8')
+            toml_data = tomllib.loads(toml_content)
+            
             marker_data = toml_data.get('Deed', {}).get('marker')
+            if not marker_data:
+                self.log("WARN: Marker array is empty or missing in [Deed]. Cannot re-sequence.")
+                return
 
-            if marker_data is None:
-                self.log(f"WARNING: 'Deed.marker' array not found in {toml_path.name}.")
-                return []
-                
-            return marker_data
+            # 2. Get Column Specification and indices
+            expected_columns = self.config.get('COLSPEC_TOML', None)
+            if not expected_columns or 'MRK_SEQ' not in expected_columns or 'SEQ_NUM' not in expected_columns:
+                self.log("ERROR: 'COLSPEC_TOML' missing or does not contain 'MRK_SEQ' and 'SEQ_NUM'.")
+                return
             
-        except Exception as e:
-            self.log(f"ERROR: Failed to parse markers from {toml_path.name}: {e}")
-            return []
-
-    def create_parcel_plot(self, toml_path: Path):
-        """
-        Creates a Matplotlib plot with THAI FONT, Area Calculation, and Centroid Labeling.
-        """
-
-        if plt is None or pd is None or np is None:
-            self.log("ERROR: Matplotlib libraries not found.")
-            return
-
-        marker_data = self._extract_and_parse_markers(toml_path)
-        #import pdb ;pdb.set_trace()        
-        if not marker_data:
-            self.log("WARNING: Cannot create plot. No marker data available.")
-            return
-
-        df = pd.DataFrame(marker_data)
-        
-        expected_columns = ['NUM_SEQ', 'MRK_SEQ'] + ["MRK_DOL", "NORTHING", "EASTING"]
-        expected_count = len(expected_columns)
-        actual_count = len(df.columns)
-        
-        if actual_count == expected_count:
-            df.columns = expected_columns
-        else:
-            self.log(f"WARNING: Plotting skipped. Mismatch columns. Expected {expected_count}, got {actual_count}.")
-            return 
-
-        col_easting = "EASTING"
-        col_northing = "NORTHING"
-        col_marker = "MRK_DOL"
-
-        # --- AREA & UNIT CALCULATION (Shoelace Formula) ---
-        x_coords = df[col_easting].to_numpy()
-        y_coords = df[col_northing].to_numpy()
-        
-        # Calculate signed area using Shoelace formula
-        # Area = 0.5 * | sum(x_i * y_{i+1} - x_{i+1} * y_i) |
-        # We use np.roll to shift the array indices for the i+1 term
-        # This handles the closing of the loop automatically if data isn't explicitly closed,
-        # but Shoelace works best if vertices are ordered (perimeter).
-        area_sqm = 0.5 * np.abs(np.dot(x_coords, np.roll(y_coords, 1)) - np.dot(y_coords, np.roll(x_coords, 1)))
-        
-        # Convert to Thai Units
-        # 1 Rai = 1600 sqm, 1 Ngan = 400 sqm, 1 Sq Wah = 4 sqm
-        sq_wah_total = area_sqm / 4.0
-        rai = int(sq_wah_total // 400)
-        remainder_wah = sq_wah_total % 400
-        ngan = int(remainder_wah // 100)
-        wah = remainder_wah % 100
-        
-        area_text = f"rnw = {rai}-{ngan}-{wah:.1f}"
-        
-        # --- CENTROID CALCULATION (Visual Center) ---
-        # For visual labeling, arithmetic mean of vertices is robust and sufficient
-        cx = np.mean(x_coords)
-        cy = np.mean(y_coords)
-
-        # --- PLOTTING ---
-        easting = df[col_easting].tolist()
-        northing = df[col_northing].tolist()
-
-        # Close the loop for drawing
-        if easting[0] != easting[-1] or northing[0] != northing[-1]:
-             easting.append(easting[0])
-             northing.append(northing[0])
-        
-        parent_dir = toml_path.parent
-        base_name_str = parent_dir.name 
-        plot_png_path = parent_dir / f"{base_name_str}_plot.png" 
-        
-        try:
-            # --- FONT CONFIGURATION FOR THAI ---
-            plt.rcParams['font.family'] = 'Tahoma'
-            fig, ax = plt.subplots(figsize=(6, 5))
-        
-            # Set the face color of the figure and the axes explicitly
-            fig.set_facecolor('white') 
-            ax.set_facecolor('white')
+            # 3. Create DataFrame and Re-sequence
+            df = pd.DataFrame(marker_data, columns=expected_columns)
             
-            # Plot Polygon
-            ax.plot(
-                easting, 
-                northing, 
-                color='red', 
-                linewidth=2, 
-                marker='o', 
-                markersize=8,  # Increased size
-                markerfacecolor='white',  # Creates the white hole
-                markeredgecolor='red'     # Ensures the perimeter remains red
-            )
+            # Generate new sequence labels for MRK_SEQ (A, B, ...)
+            new_mrk_seq = [_to_excel_style_label(i) for i in range(len(df))]
+            # Generate new sequence numbers for SEQ_NUM (1, 2, 3, ...)
+            new_seq_num = list(range(1, len(df) + 1))
             
-            x_arr = np.array(easting)
-            y_arr = np.array(northing)
-            ax.fill(x_arr, y_arr, color='red', alpha=0.1)
+            # Update the DataFrame columns
+            df['MRK_SEQ'] = new_mrk_seq
+            df['SEQ_NUM'] = new_seq_num
+            
+            # 4. Convert back to list of lists and update TOML dictionary
+            updated_marker_data = df.values.tolist()
+            toml_data['Deed']['marker'] = updated_marker_data
+            
+            # 5. Serialize dictionary back to TOML string
+            new_toml_content = _dict_to_simple_toml(toml_data)
 
-            # Plot Marker Labels
-            for _, row in df.iterrows():
-                label = f"{row['MRK_SEQ']}: {row[col_marker]}"
-                ax.text(
-                    row[col_easting], 
-                    # Adjust y-offset based on range to prevent overlap with the polygon line
-                    row[col_northing] + (np.max(northing) - np.min(northing)) * 0.005, 
-                    label, 
-                    color='blue', 
-                    fontsize=14, 
-                    ha='center', 
-                    va='bottom'
-                )
+            # 6. Overwrite file and update editor view
+            edit_toml_path.write_text(new_toml_content, encoding='utf-8')
+            self.edit_ocr_editor.set_content(new_toml_content)
+            self.log(f"SUCCESS: SEQ_NUM and MRK_SEQ columns re-sequenced and saved to {edit_toml_path.name}.")
+            
+            # 7. Replot the data to visualize changes immediately
+            self.on_plot_click() 
 
-            # Plot Area Text at Centroid
-            ax.text(cx, cy, area_text, 
-                    color='darkred', 
-                    fontsize=14, 
-                    fontweight='bold',
-                    ha='center', 
-                    va='center',
-                    bbox=dict(facecolor='white', alpha=0.8, edgecolor='none', pad=3))
-
-            # REMAINING PLOT SETUP/SAVE CODE WOULD FOLLOW HERE
-            ax.set_xlabel(f'{col_easting} (m)')
-            ax.set_ylabel(f'{col_northing} (m)')
-            ax.set_title(f"Parcel Plot: {toml_path.name}")
-            ax.grid(True, linestyle='--', alpha=0.6) 
-            ax.set_aspect('equal', adjustable='box') 
-            
-            self.log(f"I/O WRITE: Saving plot to {plot_png_path.name}")
-            plt.savefig(plot_png_path, bbox_inches='tight', facecolor='white')
-            plt.clf()       # Clear the current figure (optional)
-            plt.close(fig)  # Close the specific figure 
-            plt.close('all')  # Ensures all hidden figures are closed (optional)
-            
-            self.log(f"SUCCESS: Saved plot to {plot_png_path.name}")
-            
-            self.current_plot_path = plot_png_path 
-            self.load_plot_image(plot_png_path)
+            # Ensure the editor state is correctly set after direct manipulation
+            self.edit_ocr_editor.disable_editing()
+            self.save_edit_button.config(text="Edit/Save TOML")
+            self.is_editing = False
 
         except Exception as e:
-            self.log(f"ERROR creating Matplotlib plot: {e}")
+            self.log(f"FATAL ERROR during MRK_SEQ re-sequencing: {e}")
+            messagebox.showerror("Re-sequence Error", f"Failed to re-sequence markers.\nDetails: {e}")
+
 
     def on_save_or_edit_click(self):
-        """
-        Toggles the editor state: saves when switching from editable to read-only.
-        """
-        if self.edit_ocr_editor.cget('state') == tk.NORMAL:
-            # Currently editing -> Perform Save and Disable
-            save_successful = self.save_edited_toml()
-            if save_successful:
-                # Reload/Regenerate plot after successful save
-                parent_dir = self.current_image_path.parent
-                base_name_for_toml = self.current_image_path.stem
-                if base_name_for_toml.lower().endswith('_rv25j'):
-                    base_name_for_toml = base_name_for_toml[:-6]
-                
-                edit_toml_path = parent_dir / f"{base_name_for_toml}_OCRedit.toml"
-                
-                if plt is not None:
-                     self.create_parcel_plot(edit_toml_path)
-                
-                self.edit_ocr_editor.config(background='#f0f0f0') 
-                self.log("Action: Verification TOML editor disabled (Saved).")
+        """Toggles between Edit mode and Save mode."""
+        if self.is_editing:
+            # Currently in Edit mode, switch to Save
+            if self.save_edited_toml():
+                self.edit_ocr_editor.disable_editing()
+                self.save_edit_button.config(text="Edit/Save TOML")
+                self.is_editing = False
         else:
-            # Currently disabled -> Enable Editing
-            self.edit_ocr_editor.config(state=tk.NORMAL, background='yellow')
-            self.log("Action: Verification TOML editor enabled.")
-
-    def OCR_Process(self, is_all: bool):
-        """Simulates or runs OCR."""
-        if not self.current_image_path:
-            self.log("ERROR: No image selected to run OCR.")
-            return False
-
-        if not USE_SIMULATED_TOML:
-            self.log("INFO: Skipping simulated OCR process. Relying on external *_OCR.toml.")
-            return True
-
-        parent_dir = self.current_image_path.parent
-        base_name_str = self.current_image_path.stem
-        if base_name_str.lower().endswith('_rv25j'):
-            base_name_str = base_name_str[:-6] 
-
-        ocr_toml_path = parent_dir / f"{base_name_str}_OCR.toml"
-        
-        try:
-            self.log(f"I/O WRITE: Writing simulated OCR data to {ocr_toml_path.name}")
-            with open(ocr_toml_path, 'w', encoding='utf-8') as f:
-                f.write(SIMULATED_OCR_TOML_CONTENT)
+            # Currently in View mode, switch to Edit
+            self.edit_ocr_editor.enable_editing()
+            self.save_edit_button.config(text="Save TOML")
+            self.is_editing = True
+            self.log("INFO: TOML Editor unlocked for manual changes (Yellow Background).")
             
-            self.log(f"SUCCESS: Simulated OCR result saved to {ocr_toml_path.name}.")
-            return True
-        except Exception as e:
-            self.log(f"ERROR saving simulated OCR TOML: {e}")
-            return False
-
-    def on_ocr_click(self, is_all=False):
-        """Handles the event when OCR buttons are clicked."""
-        if not self.current_image_path:
-            self.log("ERROR: No image selected to run OCR.")
-            return
-
-        if is_all:
-            self.log("Action: Running OCR on ALL files (SIMULATED/EXTERNAL).")
-            process_success = self.OCR_Process(is_all=True)
-        else:
-            self.log(f"Action: Running OCR on current image (SIMULATED/EXTERNAL): {self.current_image_path.name}")
-            process_success = self.OCR_Process(is_all=False)
-            
-        if process_success:
-            parent_dir = self.current_image_path.parent
-            base_name_str = self.current_image_path.stem
-            if base_name_str.lower().endswith('_rv25j'):
-                base_name_str = base_name_str[:-6] 
-                
-            self.load_files(parent_dir, base_name_str)
-        
     def save_edited_toml(self):
         """Saves content to *_OCRedit.toml."""
-        if self.edit_ocr_editor.cget('state') == tk.DISABLED:
-            self.log("ERROR: Cannot save. Editor is disabled. Click 'Edit/Save TOML' first.")
+        if not self.output_dir or not self.base_name:
+            self.log("ERROR: Output path not set.")
             return False
-        
-        if not self.current_image_path:
-            self.log("ERROR: No current image path available for saving.")
-            return False
-
-        parent_dir = self.current_image_path.parent
-        base_name_str = self.current_image_path.stem
-        if base_name_str.lower().endswith('_rv25j'):
-            base_name_str = base_name_str[:-6]
             
-        edit_toml_path = parent_dir / f"{base_name_str}_OCRedit.toml"
+        edit_toml_path = self.output_dir / f"{self.base_name}_OCRedit.toml"
         
         content = self.edit_ocr_editor.get_content()
 
         try:
+            # Basic validation: try to parse TOML before saving
+            if tomllib:
+                tomllib.loads(content) 
+            
             edit_toml_path.write_text(content, encoding='utf-8')
-            self.log(f"SUCCESS: Verification TOML saved to {edit_toml_path.name}.")
-            self.edit_ocr_editor.config(state=tk.DISABLED)
+            
+            # Regenerate and display plot immediately after successful save
+            self.on_plot_click() 
+            
+            self.log(f"SUCCESS: Edited TOML saved to {edit_toml_path.name} inside {self.output_dir.name}")
             return True
         except Exception as e:
-            self.log(f"ERROR saving editable TOML: {e}")
+            self.log(f"ERROR: Invalid TOML format or save error: {e}")
+            messagebox.showerror("TOML Save Error", f"Cannot save: Invalid TOML format.\nDetails: {e}")
             return False
+        
+    def on_plot_click(self):
+        """Plots the coordinates from the edited TOML data. Always closes the polygon."""
+        if not plt or not tomllib or not pd:
+            self.log("ERROR: Cannot plot. Matplotlib/TOML/Pandas library not available.")
+            return
+        
+        # 1. Retrieve the required column specification from the merged config
+        expected_columns = self.config.get('COLSPEC_TOML', None)
+        
+        if not expected_columns or len(expected_columns) < 5:
+             self.log("ERROR: Configuration missing critical spec 'COLSPEC_TOML' or it's incomplete for plotting (requires 5 columns).")
+             return
+
+        # Simulating data retrieval and plotting
+        try:
+            # Get content from the editor (which holds the latest data, saved or unsaved)
+            content = self.edit_ocr_editor.get_content()
+            data = tomllib.loads(content)
+            
+            # Simplified data extraction assuming a single [Deed] section structure for marker
+            marker_data = data.get('Deed', {}).get('marker')
+            
+            if marker_data:
+                # Use the retrieved list directly as column names
+                df = pd.DataFrame(marker_data, columns=expected_columns)
+                
+                # Assume EASTING and NORTHING are the 5th and 4th columns (index 4 and 3)
+                x_col = expected_columns[4]
+                y_col = expected_columns[3]
+                marker_col = expected_columns[2]
+
+                # --- Plotting Logic ---
+                fig, ax = plt.subplots(figsize=(6, 6))
+                
+                # Ensure the columns are numeric before plotting
+                df[x_col] = pd.to_numeric(df[x_col], errors='coerce')
+                df[y_col] = pd.to_numeric(df[y_col], errors='coerce')
+                df.dropna(subset=[x_col, y_col], inplace=True)
+
+                if df.empty:
+                    self.log("WARN: No valid numeric coordinates found after cleaning. Plot not generated.")
+                    plt.close(fig)
+                    # Clear any existing plot image if plot failed
+                    self._display_plot_image(Path("non_existent_path"))
+                    return
+                
+                # --- FIX: Close the polygon (append first row to the end) ---
+                closed_df = pd.concat([df, df.iloc[[0]]], ignore_index=True)
+                
+                ax.plot(closed_df[x_col], closed_df[y_col], 'o-', label='Survey Points')
+                
+                # Annotate markers using the original (non-closed) DataFrame
+                for i, row in df.iterrows():
+                    # Annotate using the marker name (e.g., MRK_DOL)
+                    # Use a smaller font size for annotations so they don't overlap too much
+                    ax.annotate(str(row[marker_col]), (row[x_col], row[y_col]), 
+                                textcoords="offset points", xytext=(5,5), ha='center', fontsize=8)
+                
+                # Set font property for title and labels explicitly for Thai
+                font_properties = {'family': 'Tahoma', 'size': 12}
+                ax.set_title(f"Survey Plot: {self.base_name}", fontdict=font_properties)
+                ax.set_xlabel("Easting (X)", fontdict=font_properties)
+                ax.set_ylabel("Northing (Y)", fontdict=font_properties)
+                
+                ax.grid(True)
+                ax.axis('equal') # Important for spatial data
+
+                # Save plot to the output directory
+                plot_path = self.output_dir / f"{self.base_name}_plot.png"
+                fig.savefig(plot_path)
+                
+                plt.close(fig) # Close figure to free memory
+                self.log(f"SUCCESS: Plot saved to {plot_path.name}")
+                
+                # Update the plot preview widget immediately
+                self._display_plot_image(plot_path)
+
+            else:
+                self.log("ERROR: TOML data structure is missing the 'marker' array under [Deed].")
+
+        except Exception as e:
+            self.log(f"ERROR during plotting: {e}")
+            messagebox.showerror("Plot Error", f"An error occurred during plotting:\n{e}")

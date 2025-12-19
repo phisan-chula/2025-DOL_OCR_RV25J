@@ -14,13 +14,13 @@ IND75_WGS84 = [204.5,837.9,294.8]        # IndianDatum 1975 to WGS 1984
 COLSPEC_RV25J = [ "MRK_DOL" ,"NORTHING","EASTING" ]    # 0th , ...,  -2nd, -1st 
 COLSPEC_TOML  = [ "SEQ_NUM", "MRK_SEQ", "MRK_DOL" ,"NORTHING","EASTING" ]
 
-VIEW_SCALE = 0.25   # only!!! 0.25  0.5   1.0
+VIEW_SCALE = 1.0   # only!!! 0.25  0.5   1.0
 
 # --- UI/Application Constants (Now flat) ---
 WINDOW_TITLE = "RV25J OCR Center"
 DEFAULT_WIDTH = 1300
 DEFAULT_HEIGHT = 850
-DEFAULT_FONT = ['Tahoma', 12]
-LOG_FONT = ['Courier New', 12]
+DEFAULT_FONT = ['Tahoma', 20]
+LOG_FONT = ['Courier New', 20]
 
 

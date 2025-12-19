@@ -8,13 +8,12 @@ import sys
 import argparse 
 
 # Import the configuration manager from the other file
+# Using the correct module name based on file name CONFIG_AppRV25J.py
 from CONFIG_AppRV25J import Config_AppRV25J 
 
 # --- Custom Component Imports (Assumed to be in the same directory) ---
 from ImageSelect import ImageSelect 
 from Toml_Verify_Edit import OCRTomlEditor 
-
-# --- Configuration Constants (Removed LOCAL_CONFIG_FILE) ---
 
 # Default fallback if config load fails or key is missing
 DEFAULT_IMAGE_DIR = r".\RV25J_L1L2"
@@ -27,358 +26,416 @@ class RV25J_OCR_Center(tk.Tk):
     def __init__(self, initial_dir_arg: str): # initial_dir_arg is now guaranteed to be set
         super().__init__()
         
-        # 1. Load Configuration using Config_AppRV25J
-        app_file_dir = Path(__file__).parent
-        self.config_manager = Config_AppRV25J(app_file_dir=app_file_dir)
+        # 4. Initialize Core Variables (Ensure activity_log is initialized for early logging)
+        self.activity_log: tk.Text | None = None
+        self.file_list = []
+        self.image_selector: ImageSelect = None
+        self.ocr_editor_panel: OCRTomlEditor = None
+        self.current_image_path: Path | None = None # Attribute to track current image
+        
+        # 1. Load Configuration using the centralized manager (Loads Global only)
+        self.config_manager = self._load_central_config()
         
         # Access the initial (GLOBAL) configuration
         current_config = self.config_manager.CONFIG 
+
+        # 2. Setup Defaults based on Config 
         
-        # 2. Load UI Constants from Configuration (Using Flat Keys)
-        self.WINDOW_TITLE = current_config.get('WINDOW_TITLE', "RV25J OCR Center")
-        self.DEFAULT_WIDTH = current_config.get('DEFAULT_WIDTH', 1300)
-        self.DEFAULT_HEIGHT = current_config.get('DEFAULT_HEIGHT', 850)
+        # --- Load and assign UI parameters from configuration ---
         
-        default_font_list = current_config.get('DEFAULT_FONT', ['Tahoma', 10])
-        self.DEFAULT_FONT = tuple(default_font_list)
+        # Load Window Settings with Fallbacks
+        self.window_title = current_config.get('WINDOW_TITLE', "RV25J OCR Center (Fallback)")
+        self.default_width = current_config.get('DEFAULT_WIDTH', 1300)
+        self.default_height = current_config.get('DEFAULT_HEIGHT', 850)
+
+        # Load Font Settings with Fallbacks and conversion to Tkinter tuple format
+        # TOML stores ['FontName', Size] list, which needs to be a tuple for Tkinter font parameter.
+        default_font_list = current_config.get('DEFAULT_FONT', ['Tahoma', 16])
+        self.default_font = tuple(default_font_list)
         
-        log_font_list = current_config.get('LOG_FONT', ['Courier New', 9])
-        self.LOG_FONT = tuple(log_font_list)
+        log_font_list = current_config.get('LOG_FONT', ['Courier New', 16])
+        self.log_font = tuple(log_font_list)
+
+        # Load other application defaults
+        self.current_scale = current_config.get('VIEW_SCALE', 0.5) 
+        self.default_dir_str = current_config.get('DEFAULT_IMAGE_DIR', initial_dir_arg)
         
-        # 3. Setup other Defaults based on Config and Command Line
-        initial_scale = current_config.get('VIEW_SCALE', 0.25)
-        
-        # Use the required positional command line argument
-        if Path(initial_dir_arg).is_dir():
-            self.default_dir_str = initial_dir_arg
-        else:
-            # If the provided path isn't a directory, we raise an error or use a safe fallback.
-            # Since argparse handles non-existent paths, this is mainly for error handling if the path is invalid after parsing.
-            print(f"ERROR: Initial directory '{initial_dir_arg}' is not a valid directory. Using fallback.", file=sys.stderr)
-            self.default_dir_str = DEFAULT_IMAGE_DIR
-        
-        # 4. Setup Main Window (using loaded constants)
-        self.title(self.WINDOW_TITLE)
-        self.geometry(f"{self.DEFAULT_WIDTH}x{self.DEFAULT_HEIGHT}")
-        
-        # 5. Style Configuration
-        self.style = ttk.Style(self)
-        self.style.theme_use('clam')
-        self.style.configure('Yellow.TButton', background='yellow')
-        self.style.configure('Red.TButton', background='red', foreground='white') 
-        
-        # 6. State Variables
-        self.current_scale = 1.0
-        self.current_image_path = tk.StringVar(value="")
         self.zoom_buttons = {}
-        # Working folder used for loading local config and files
-        self.working_folder = app_file_dir # Initial folder is the app folder
 
-        # 7. Build UI Layout
-        self._create_frames()
-        self._create_middle_frame() # Must be created before Upper to init panels
-        self._create_upper_frame() 
-        self._create_lower_frame()
+        # 3. Setup Window (Using loaded variables)
+        self.title(self.window_title)
+        self.geometry(f"{self.default_width}x{self.default_height}")
         
-        self.log_activity("Application started successfully.")
+        # 5. Build UI Layout
+        self.create_widgets()
         
-        # 8. Initial Load
-        self.log_activity(f"Attempting to load files from: {self.default_dir_str}")
+        # 6. Load Initial Data (and trigger local config load/merge)
+        self.load_initial_dir()
         
-        # Set the initial working folder based on the determined directory
-        self.working_folder = Path(self.default_dir_str)
-        if not self.working_folder.is_dir():
-            self.working_folder = app_file_dir
+        self.protocol("WM_DELETE_WINDOW", self.on_quit)
+
+
+    def _load_central_config(self):
+        """
+        Instantiates the Config_AppRV25J and loads GLOBAL configuration, capturing logs.
+        """
+        app_file_dir = Path(sys.argv[0]).parent
+        
+        try:
+            # 1. Instantiate the Manager
+            manager = Config_AppRV25J(app_file_dir=app_file_dir)
             
-        # The load_file_list function will now also load the LOCAL config
-        self.load_file_list(self.default_dir_str) 
-        self._set_scale(initial_scale)
+            # 2. Call the global load method explicitly to run the setup and capture logs
+            global_log_messages = manager.load_global_config_and_log()
+            
+            # Log the successful messages
+            for msg in global_log_messages:
+                 self.log_activity(msg)
+            
+            return manager
+            
+        except RuntimeError as e:
+            # Catch the specific exception raised by the config manager on failure
+            self.log_activity(f"FATAL GLOBAL CONFIG ERROR: {e}. Application cannot start.")
+            sys.exit(1)
+        except Exception as e:
+            # Catch any unexpected errors during instantiation or logging
+            self.log_activity(f"CRITICAL ERROR during config startup: {e}. Application cannot start.")
+            sys.exit(1)
 
-    # ========================================================
-    # UI CONSTRUCTION
-    # ========================================================
-
-    def _create_frames(self):
-        """Top-level layout frames."""
-        self.upper_frame = ttk.Frame(self, padding="5 10 5 5", relief=tk.FLAT)
-        self.upper_frame.pack(side=tk.TOP, fill=tk.X)
-
-        self.middle_frame = ttk.Frame(self, padding="5", relief=tk.FLAT)
-        self.middle_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-
-        self.lower_frame = ttk.Frame(self, padding="5", relief=tk.SUNKEN)
-        self.lower_frame.pack(side=tk.BOTTOM, fill=tk.X)
-
-    def _create_upper_frame(self):
-        """Controls: Open, Zoom, Save (OCR button removed)."""
-        # -- Left Controls Container --
-        left_controls = ttk.Frame(self.upper_frame)
-        left_controls.pack(side=tk.LEFT, padx=5)
+    def create_widgets(self):
+        """Builds the main UI structure."""
+        self.grid_rowconfigure(0, weight=1)
         
-        # Open Button
-        ttk.Button(left_controls, text="Open...", command=self._open_directory).pack(side=tk.LEFT, padx=5)
-
-        # Separator
-        ttk.Separator(left_controls, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill='y')
-        # Use self.DEFAULT_FONT
-        ttk.Label(left_controls, text="Zoom:", font=self.DEFAULT_FONT).pack(side=tk.LEFT, padx=(0, 5))
+        # --- LAYOUT FIX: Adjust column weights for larger center panel (1:4:1) ---
+        self.grid_columnconfigure(0, weight=1)  # Left Panel (File List)
+        self.grid_columnconfigure(1, weight=8)  # Center Panel (Image/Plot Viewer) - BIGGER
+        self.grid_columnconfigure(2, weight=1)  # Right Panel (Editor/Log) - SMALLER
         
-        # Zoom Buttons (using tk.Button for relief control)
-        self.zoom_buttons[1.0] = tk.Button(left_controls, text="1:1", command=lambda: self._set_scale(1.0))
-        self.zoom_buttons[0.5] = tk.Button(left_controls, text="1:2", command=lambda: self._set_scale(0.5))
-        self.zoom_buttons[0.25] = tk.Button(left_controls, text="1:4", command=lambda: self._set_scale(0.25))
-
-        self.zoom_buttons[1.0].pack(side=tk.LEFT, padx=2)
-        self.zoom_buttons[0.5].pack(side=tk.LEFT, padx=2)
-        self.zoom_buttons[0.25].pack(side=tk.LEFT, padx=2)
-
-        # Separator
-        ttk.Separator(left_controls, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill='y')
+        # Initialize ttk style (needed for button appearance change)
+        self.style = ttk.Style()
         
-        # Edit/Save Button
-        ttk.Button(left_controls, 
-                   text="Edit/Save TOML", 
-                   command=self._handle_save_or_edit_click,
-                   style='Yellow.TButton'
-                   ).pack(side=tk.LEFT, padx=10)
+        # Restoring original styles (NO PADDING/SMALLER FONT)
+        self.style.configure('Toggled.TButton', background='lightgray', foreground='black')
+        self.style.configure('Default.TButton', background='SystemButtonFace', foreground='black')
         
-        # Quit Button
-        ttk.Button(self.upper_frame, text="Quit", command=self.destroy).pack(side=tk.RIGHT, padx=5)
+        # Setting style for Red Button (original font size)
+        self.style.configure('Danger.TButton', background='red', foreground='white', font=('Tahoma', 12, 'bold'))
+        self.style.map('Danger.TButton',
+                       background=[('active', '#CC0000')], # Darker red on hover
+                       foreground=[('active', 'white')])
 
-    def _create_middle_frame(self):
-        """3-Column Layout: List | Image | Editor."""
-        # Configure Grid Weights
-        self.middle_frame.columnconfigure(0, weight=15) # File List
-        self.middle_frame.columnconfigure(1, weight=65) # Image
-        self.middle_frame.columnconfigure(2, weight=20) # Editor
-        self.middle_frame.rowconfigure(0, weight=1)
 
-        # 1. Left Subframe (File List)
-        self.left_subframe = ttk.Frame(self.middle_frame, padding="5", relief=tk.RIDGE)
-        self.left_subframe.grid(row=0, column=0, sticky='nsew', padx=5, pady=5)
-        self._create_file_list(self.left_subframe)
+        # --- Left Panel: File List ---
+        left_panel = ttk.Frame(self, padding="5")
+        left_panel.grid(row=0, column=0, sticky='nsew')
+        left_panel.grid_rowconfigure(1, weight=1)
+        left_panel.grid_columnconfigure(0, weight=1)
 
-        # 2. Middle Subframe (Image)
-        self.mid_subframe = ttk.Frame(self.middle_frame, padding="5", relief=tk.RIDGE)
-        self.mid_subframe.grid(row=0, column=1, sticky='nsew', padx=5, pady=5)
-        self._create_image_display(self.mid_subframe)
-
-        # 3. Right Subframe (Editor)
-        self.right_subframe = ttk.Frame(self.middle_frame, padding="5", relief=tk.RIDGE)
-        self.right_subframe.grid(row=0, column=2, sticky='nsew', padx=5, pady=5)
-        self._create_ocr_verification_panel(self.right_subframe)
-
-    def _create_file_list(self, parent):
-        """File List with Vertical AND Horizontal Scrollbars."""
-        parent.rowconfigure(1, weight=1)
-        parent.columnconfigure(0, weight=1)
+        ttk.Button(left_panel, text="Change Directory", 
+           command=self.select_directory).grid(row=0, column=0, sticky='ew', pady=(0, 5))
         
-        # Use self.DEFAULT_FONT
-        ttk.Label(parent, text="RV25J Image Files", font=self.DEFAULT_FONT).grid(row=0, column=0, sticky='w', pady=2)
-        
-        # Treeview setup
-        self.file_list = ttk.Treeview(parent, columns=('Path'), show='tree', selectmode='browse')
-        self.file_list.heading('#0', text='File List')
-        
-        # REVERTED: Width restored to 250 (original)
-        self.file_list.column('#0', width=250) 
-        
-        # Hidden column to store actual full path
-        self.file_list.column('Path', width=0, stretch=tk.NO) 
-        
-        # Vertical Scrollbar
-        yscroll = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=self.file_list.yview)
-        self.file_list.configure(yscrollcommand=yscroll.set)
+        # Use self.default_font
+        self.file_listbox = tk.Listbox(left_panel, font=self.default_font, bg='#2E2E2E', fg='white')
+        self.file_listbox.grid(row=1, column=0, sticky='nsew')
+        self.file_listbox.bind('<<ListboxSelect>>', self.on_file_select)
 
-        # Horizontal Scrollbar
-        xscroll = ttk.Scrollbar(parent, orient=tk.HORIZONTAL, command=self.file_list.xview)
-        self.file_list.configure(xscrollcommand=xscroll.set)
+        # --- Center Panel: Image Viewer ---
+        center_panel = ttk.Frame(self, padding="5")
+        center_panel.grid(row=0, column=1, sticky='nsew')
+        center_panel.grid_rowconfigure(1, weight=1)
+        center_panel.grid_columnconfigure(0, weight=1)
 
-        # Grid placement
-        self.file_list.grid(row=1, column=0, sticky='nsew')
-        yscroll.grid(row=1, column=1, sticky='ns')
+        # Top Buttons (Zoom, Quit)
+        control_frame = ttk.Frame(center_panel)
+        control_frame.grid(row=0, column=0, sticky='ew', pady=(0, 5))
+
+        ttk.Label(control_frame, text="Zoom:").pack(side=tk.LEFT, padx=(0, 5))
+        self._add_zoom_buttons(control_frame) # Contains 25%, 50%, 100%
+
+        # --- New Vertical Separator and Remove Button ---
+        ttk.Separator(control_frame, orient=tk.VERTICAL).pack(side=tk.LEFT, padx=10, fill='y')
+
+        # Uses the Danger.TButton style for red background
+        ttk.Button(control_frame, text="Remove OCR", style='Danger.TButton', 
+                   command=self._remove_ocr_files).pack(side=tk.LEFT, padx=5)
+        # --- End New Elements ---
+
+        ttk.Button(control_frame, text="Quit", command=self.on_quit).pack(side=tk.RIGHT)
         
-        # The scrollbar already fills the space allotted to its column (column=0) 
-        # because the sticky='ew' and row=2 combination forces it to stretch 
-        # horizontally across the width of the treeview.
-        xscroll.grid(row=2, column=0, sticky='ew')
+        # Image Selector Widget
+        self.image_selector = ImageSelect(center_panel, log_callback=self.log_activity)
+        self.image_selector.grid(row=1, column=0, sticky='nsew')
 
-        # Bind selection event
-        self.file_list.bind('<<TreeviewSelect>>', self._on_file_select)
-
-        # Bind selection event
-        self.file_list.bind('<<TreeviewSelect>>', self._on_file_select)
-
-    def _create_image_display(self, parent):
-        """Embeds ImageSelect component."""
-        parent.rowconfigure(0, weight=1)
-        parent.columnconfigure(0, weight=1)
-        self.image_selector = ImageSelect(parent, log_callback=self.log_activity, relief=tk.SUNKEN)
-        self.image_selector.grid(row=0, column=0, sticky='nsew')
-
-    def _create_ocr_verification_panel(self, parent):
-        """Embeds OCRTomlEditor component."""
-        parent.rowconfigure(0, weight=1)
-        parent.columnconfigure(0, weight=1)
+        # --- Right Panel: Editor and Log ---
+        right_panel = ttk.Frame(self, padding="5")
+        right_panel.grid(row=0, column=2, sticky='nsew')
         
-        panel_container = ttk.Frame(parent)
-        panel_container.pack(fill='both', expand=True)
-        
-        # Get column spec from the merged configuration
-        column_spec = self.config_manager.CONFIG.get('COLSPEC_RV25J', []) 
-        
-        self.ocr_editor_panel = OCRTomlEditor(
-            panel_container, 
-            log_callback=self.log_activity, 
-            column_spec=column_spec,
-            relief=tk.FLAT
-        )
-        self.ocr_editor_panel.pack(fill='both', expand=True)
+        # CONFIGURE EXPANDING ROWS: 50% for Editor, 50% for Log Text
+        right_panel.grid_rowconfigure(0, weight=1) # Row 0: TOML Editor 
+        right_panel.grid_rowconfigure(2, weight=1) # Row 2: Activity Log Text 
+        right_panel.grid_columnconfigure(0, weight=1)
 
-    def _create_lower_frame(self):
-        """Activity Log."""
-        self.lower_frame.rowconfigure(0, weight=1)
-        self.lower_frame.columnconfigure(0, weight=1)
+        # OCR TOML Editor (Row 0)
+        self.ocr_editor_panel = OCRTomlEditor(right_panel, log_callback=self.log_activity)
+        self.ocr_editor_panel.grid(row=0, column=0, sticky='nsew', pady=(0, 5))
+
+        # Activity Log Label (Row 1 - fixed height)
+        ttk.Label(right_panel, text="Activity Log:").grid(row=1, column=0, sticky='sw')
         
-        # Use self.DEFAULT_FONT
-        ttk.Label(self.lower_frame, text="Activity Log / Console Output", font=self.DEFAULT_FONT).grid(row=0, column=0, sticky='w')
+        # Activity Log (Widget creation) (Row 2 - expanding height)
+        self.activity_log = tk.Text(right_panel, height=10, font=self.log_font, bg='#1E1E1E', fg='#E0E0E0')
+        self.activity_log.grid(row=2, column=0, sticky='nsew')
+        self.activity_log.config(state=tk.DISABLED)
         
-        self.activity_log = tk.Text(
-            self.lower_frame, height=6, width=1, state=tk.DISABLED,
-            # Use self.LOG_FONT
-            font=self.LOG_FONT, relief=tk.FLAT, background='#f0f0f0'
-        )
-        self.activity_log.grid(row=1, column=0, sticky='nsew', pady=5)
+        self.log_activity("UI components initialized.")
+
+
+    def _add_zoom_buttons(self, master):
+        """Adds zoom buttons to the control frame."""
+        zoom_levels = {0.25: "25%", 0.5: "50%", 1.0: "100%"}
         
-        log_scroll = ttk.Scrollbar(self.lower_frame, orient=tk.VERTICAL, command=self.activity_log.yview)
-        log_scroll.grid(row=1, column=1, sticky='ns', pady=5)
-        self.activity_log.config(yscrollcommand=log_scroll.set)
-
-    # ========================================================
-    # LOGIC & EVENTS
-    # ========================================================
-
-    def load_file_list(self, base_dir):
-        """
-        Scans dir for *_RV25J.jpg, SORTS them, and adds NUMBERING.
-        Also loads the LOCAL configuration.
-        """
-        # Clear existing
-        for item in self.file_list.get_children():
-            self.file_list.delete(item)
-
-        root_path = Path(base_dir)
-        if not root_path.is_dir():
-            self.log_activity(f"Error: Invalid directory: {root_path}")
-            return
-
-        # Set the working folder and load/merge local config
-        self.working_folder = root_path
-        self.log_activity(f"Working directory set to: {self.working_folder}")
-        self.config_manager.update_with_local(self.working_folder)
+        for val, text in zoom_levels.items():
+            btn = ttk.Button(master, text=text, style='Default.TButton', 
+                             command=lambda v=val: self._set_scale(v))
+            btn.pack(side=tk.LEFT, padx=2)
+            self.zoom_buttons[val] = btn
         
-        all_rv25j_files = []
-        
-        # 1. Scan recursively
-        for dirpath, _, filenames in os.walk(root_path):
-            current_dir = Path(dirpath)
-            for f in filenames:
-                if f.lower().endswith('_rv25j.jpg'):
-                    all_rv25j_files.append(current_dir / f)
+        self._set_scale(self.current_scale)
 
-        # 2. Sort Alphabetically
-        all_rv25j_files.sort()
-
-        # 3. Insert with Numbering [1], [2]...
-        for idx, file_path in enumerate(all_rv25j_files, start=1):
-            # Display: [1] C:\Path\...\Img_RV25J.jpg
-            display_text = f"[{idx}] {file_path}"
-            # Values: Clean path (hidden)
-            self.file_list.insert('', tk.END, text=display_text, values=(str(file_path),))
-
-        self.log_activity(f"Scanned '{root_path}'. Found {len(all_rv25j_files)} files (Sorted & Numbered).")
-
-    def _on_file_select(self, event):
-        """Handles selection from the Treeview."""
-        selected_item = self.file_list.focus()
-        if not selected_item: return
-        
-        item_data = self.file_list.item(selected_item)
-        
-        # EXTRACT PATH FROM HIDDEN VALUE
-        if item_data['values']:
-            file_path_str = item_data['values'][0]
+    def load_initial_dir(self):
+        """Loads files from the directory passed via CLI argument."""
+        # The initial_dir_arg passed to __init__ is already stored in self.default_dir_str
+        default_path = Path(self.default_dir_str)
+        if default_path.is_dir():
+            # Automatically load the directory provided by the CLI
+            self.select_directory(initial_dir=str(default_path), skip_dialog=True)
         else:
-            file_path_str = item_data['text'] # Fallback
-            
-        path_obj = Path(file_path_str)
-        if not path_obj.exists():
-            self.log_activity(f"Error: File not found {file_path_str}")
-            return
-            
-        self.current_image_path.set(file_path_str)
-        self.log_activity(f"Selected: {path_obj.name}")
+            self.log_activity(f"FATAL ERROR: CLI directory not found: {default_path}. Showing directory dialog.")
+            self.select_directory(initial_dir=str(Path.cwd()), skip_dialog=False) # Fallback to dialog
 
-        # 1. Determine Base Name (remove _RV25J suffix)
-        base_name_str = path_obj.stem
+
+    def load_file_list(self, directory):
+        """Scans the directory for image files and populates the listbox."""
+        self.file_listbox.delete(0, tk.END)
+        self.file_list = []
+        search_path = Path(directory)
+        
+        for path in search_path.rglob('*_RV25J.jpg'):
+            self.file_list.append(path) 
+            # Use relative path starting from the directory name for display
+            display_name = path.relative_to(search_path.parent)
+            self.file_listbox.insert(tk.END, str(display_name))
+
+        self.log_activity(f"Found {len(self.file_list)} images in {search_path.name}.")
+        
+        if self.file_list:
+            self.file_listbox.selection_set(0)
+            self.on_file_select(None)
+
+    def on_file_select(self, event):
+        """Handles selection change in the listbox."""
+        try:
+            selection = self.file_listbox.curselection()
+            if selection:
+                index = selection[0]
+                self.load_selected_image(self.file_list[index])
+        except IndexError:
+            pass
+        except Exception as e:
+            self.log_activity(f"ERROR during file selection: {e}")
+
+    def load_selected_image(self, image_path: Path):
+        """Loads the image into the viewer and initiates editor loading."""
+        
+        self.current_image_path = image_path # Store the path
+        self.image_selector.load_image(str(image_path))
+        
+        # Ensure scale is consistent
+        view_scale_config = self.config_manager.CONFIG.get('VIEW_SCALE', 0.5) 
+        if self.current_scale != view_scale_config:
+             self._set_scale(view_scale_config)
+        else:
+             self._set_scale(self.current_scale)
+
+        # Derive base name and output directory (Original logic restored)
+        base_name_str = image_path.stem
         if base_name_str.lower().endswith('_rv25j'):
-            base_name_str = base_name_str[:-6]
-            
-        # The working folder should be the parent of the selected file to correctly 
-        # locate the corresponding TOML file and for local config loading consistency
-        self.working_folder = path_obj.parent
-        self.log_activity(f"File-specific working directory: {self.working_folder}")
-        
-        # 2. Load Image
-        if self.image_selector:
-            self.image_selector.load_image(file_path_str)
-        
-        # 3. Load TOML Data
-        if self.ocr_editor_panel:
-            self.ocr_editor_panel.load_files(self.working_folder, base_name_str)
-        
-        # 4. Apply Scale from MERGED config
-        zoom_scale = self.config_manager.CONFIG.get('VIEW_SCALE', 0.25)
-        self._set_scale(zoom_scale)
+            base_name_str = base_name_str[:-6] 
 
-    def _open_directory(self):
-        """Folder picker dialog."""
-        initial_dir = self.working_folder
-        if not initial_dir.exists(): initial_dir = Path.cwd()
+        output_dir = image_path.parent / base_name_str 
+        
+        # This call handles loading the TOML content and immediately plotting if content exists
+        # Passing the CONFIG Series as originally intended
+        self.ocr_editor_panel.load_files(output_dir, base_name_str, self.config_manager.CONFIG)
+        
+        self.log_activity(f"Loaded file: {image_path.name}")
+        
+    def select_directory(self, initial_dir: str = None, skip_dialog: bool = False):
+        """
+        Opens a file dialog to select a new base directory OR loads the initial dir.
+        Loads and merges local config based on the selected directory.
+        """
+        if initial_dir is None:
+            initial_dir = self.default_dir_str
+        
+        if not Path(initial_dir).exists():
+            initial_dir = str(Path.cwd())
             
-        directory = filedialog.askdirectory(
-            title="Select Directory with _RV25J.jpg Files",
-            initialdir=str(initial_dir)
-        )
+        directory = None
+
+        if skip_dialog:
+            directory = initial_dir
+        else:
+            directory = filedialog.askdirectory(
+                title="Select Directory with _RV25J.jpg Files",
+                initialdir=str(initial_dir)
+            )
+        
         if directory:
             self.default_dir_str = directory
-            self.log_activity(f"Directory changed to: {directory}")
-            # This call will now also trigger the local config load for the new directory
+            
+            # 1. Load Local Config and Merge using the selected directory
+            selected_path = Path(directory)
+            try:
+                # Capture and log local load and merge messages
+                merge_log_messages = self.config_manager.update_with_local(working_folder=selected_path)
+                for msg in merge_log_messages:
+                    self.log_activity(msg)
+                
+                # Update UI elements that rely on config (e.g., scale) immediately
+                self.current_scale = self.config_manager.CONFIG.get('VIEW_SCALE', 0.5)
+                self._set_scale(self.current_scale) 
+                
+            except Exception as e:
+                self.log_activity(f"WARN: Failed to load local config from {selected_path}: {e}")
+                
+            # 2. Load File List
             self.load_file_list(directory)
 
+
     def _set_scale(self, scale):
-        """Updates zoom level and button visuals."""
+        """
+        Updates zoom level and button visuals.
+        """
         self.current_scale = scale
         if self.image_selector:
             self.image_selector.set_scale(scale)
             
         for val, btn in self.zoom_buttons.items():
-            btn.config(relief='sunken' if val == scale else 'raised')
+            # Use style configuration instead of relief for modern Tkinter themes
+            if val == scale:
+                btn.configure(style='Toggled.TButton')
+            else:
+                btn.configure(style='Default.TButton')
 
     def _handle_save_or_edit_click(self):
         """Delegates save/edit to the editor panel."""
         if self.ocr_editor_panel:
             self.ocr_editor_panel.on_save_or_edit_click()
 
+    # --- Method for new "Remove OCR" functionality (Logic derived safely) ---
+    def _remove_ocr_files(self):
+        """
+        Displays a confirmation dialog and, if confirmed, deletes 
+        the *_OCR.toml, *_OCRedit.toml, AND *_plot.png files associated with the current image.
+        """
+        # 0. Initial check for loaded image
+        if not self.current_image_path: 
+            self.log_activity("WARN: No image is currently loaded. Cannot remove files.")
+            messagebox.showwarning("Warning", "No image is currently loaded to determine files.")
+            return
+
+        current_image_path = self.current_image_path
+
+        # 1. Derive all related paths from the current image path (Safe path derivation)
+        
+        # Derive base name (same logic as load_selected_image)
+        base_name_str = current_image_path.stem
+        if base_name_str.lower().endswith('_rv25j'):
+            base_name_str = base_name_str[:-6] 
+
+        # Derive output directory (e.g., C0002 folder)
+        output_dir = current_image_path.parent / base_name_str 
+        
+        # Calculate full paths for all target files (Hardcoded suffixes restored)
+        toml_path = output_dir / f"{base_name_str}_OCR.toml"
+        edit_path = output_dir / f"{base_name_str}_OCRedit.toml"
+        plot_path = output_dir / f"{base_name_str}_plot.png" 
+        
+        files_to_check = [toml_path, edit_path, plot_path]
+        
+        # 2. Pop-up Confirmation Dialog
+        confirm = messagebox.askyesno(
+            "Confirm OCR File Removal",
+            (
+                f"You are going to remove ALL OCR-related files for:\n\n"
+                f"Image Base: **{base_name_str}**\n\n"
+                f"This will attempt to remove:\n"
+                f"1. {toml_path.name}\n"
+                f"2. {edit_path.name}\n"
+                f"3. {plot_path.name}\n\n"
+                f"Do you want to proceed?"
+            ),
+            icon=messagebox.WARNING
+        )
+        
+        if confirm:
+            files_removed = []
+            
+            # 3. Delete files
+            for file_path in files_to_check:
+                try:
+                    if file_path.exists():
+                        os.remove(file_path)
+                        files_removed.append(file_path.name)
+                        self.log_activity(f"SUCCESS: Removed {file_path.name}")
+                    else:
+                        self.log_activity(f"INFO: {file_path.name} not found, skipped deletion.")
+                except Exception as e:
+                    self.log_activity(f"ERROR: Failed to remove {file_path.name}: {e}")
+            
+            # 4. Clear editor state and reload image to reflect changes
+            if files_removed:
+                # NOTE: The explicit clear_editor_and_plot() call is still removed
+                
+                # Re-trigger the load to update the editor/plot view for the current image
+                self.load_selected_image(current_image_path)
+                messagebox.showinfo("Success", f"Successfully removed: {', '.join(files_removed)}")
+            else:
+                 self.log_activity("INFO: No files were found or removed.")
+        else:
+            self.log_activity("INFO: OCR file removal cancelled by user.")
+    # --- End "Remove OCR" functionality ---
+
+
+    def on_quit(self):
+        """
+        Handles graceful exit by stopping the Tkinter event loop.
+        """
+        self.log_activity("Application quit requested. Initiating graceful shutdown...")
+        
+        self.quit()
+        self.destroy()
+
     def log_activity(self, message):
         """Appends text to the log window."""
+        if self.activity_log is None:
+            # Only print during early startup if activity_log widget isn't ready
+            print(f"EARLY LOG: {message}")
+            return
+            
+        # Ensure log entries from config_manager are clean
+        if message.startswith("EARLY LOG: "):
+             message = message[11:]
+             
         ts = time.strftime("[%H:%M:%S]")
         self.activity_log.config(state=tk.NORMAL)
         self.activity_log.insert(tk.END, f"{ts} {message}\n")
         self.activity_log.config(state=tk.DISABLED)
         self.activity_log.see(tk.END)
 
-    # Argument Parsing Method (UPDATED to use a positional argument)
+    # Argument Parsing Method (Original logic restored)
     @staticmethod
     def _parse_args():
         """Parses command line arguments for the application."""
@@ -392,9 +449,11 @@ class RV25J_OCR_Center(tk.Tk):
         parser.add_argument(
             'folder', # Positional argument name
             type=str, 
+            nargs='?', # Make positional argument optional for cleaner testing
+            default=DEFAULT_IMAGE_DIR, # Restoring original constant here
             help=(
-                "The **root directory** containing parcel documents.\n"
-                "The application will **recursively search** this directory and its subfolders\n"
+                "The **root directory** containing parcel documents.\\n"
+                "The application will **recursively search** this directory and its subfolders\\n"
                 "for all image files matching the pattern `*_rv25j.jpg` to populate the file list."
             )
         )
@@ -411,4 +470,4 @@ if __name__ == '__main__':
         app = RV25J_OCR_Center(initial_dir_arg=cli_args.folder)
         app.mainloop()
     except Exception as e:
-        print(f"CRITICAL ERROR: {e}")
+        print(f"An unexpected error occurred in mainloop: {e}", file=sys.stderr)
